@@ -1,7 +1,11 @@
 faiss-cpu
 numpy
-rank_bm25
+rank-bm25
 sentence-transformers
-anthropic
+openai
 lightgbm
 scikit-learn
+torch
+spacy
+python-dotenv
+openai

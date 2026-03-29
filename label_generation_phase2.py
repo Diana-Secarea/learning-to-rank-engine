@@ -4,13 +4,12 @@ label_generation_phase2.py — LLM Weak Label Generation (Phase 2)
 Pipeline:
   1. Diverse query set  →  top-LABEL_K candidates per query
                            (hard filter + RRF fusion + structured score)
-  2. (query, company) pairs  →  Claude Batches API  →  relevance label 0-3
+  2. (query, company) pairs  →  OpenAI Batch API  →  relevance label 0-3
   3. labels.jsonl  :  query_id | company_id | query | relevance_label
 
 Notes:
-  - Uses claude-haiku-4-5 (cheapest) for bulk classification.
-    Swap LABEL_MODEL to "claude-opus-4-6" for higher-quality labels.
-  - Batches API gives 50 % cost reduction vs. real-time calls.
+  - Uses gpt-4o-mini (cheapest) for bulk classification.
+  - OpenAI Batch API gives 50% cost reduction vs. real-time calls.
   - Resumes gracefully if a batch_id file is found on disk.
 """
 
@@ -19,11 +18,12 @@ from __future__ import annotations
 import json
 import time
 import pathlib
+import io
 
 import numpy as np
-import anthropic
-from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
-from anthropic.types.messages.batch_create_params import Request
+import openai
+from dotenv import load_dotenv
+load_dotenv()
 
 from solution import (
     RankingEngine,
@@ -34,8 +34,8 @@ from solution import (
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-LABEL_MODEL  = "claude-haiku-4-5"   # cheap 0-3 classification
-MAX_EXAMPLES = 10_000               # cap total (query, company) pairs
+LABEL_MODEL  = "gpt-4o-mini"        # cheap 0-3 classification
+MAX_EXAMPLES = 3_000                # cap total (query, company) pairs
 LABEL_K      = 200                  # candidates fetched per query
 RRF_K_VAL    = 60
 LABELS_PATH  = pathlib.Path("labels.jsonl")
@@ -202,56 +202,90 @@ def get_top_candidates(
     return scored[:k]
 
 
-# ── Batches API helpers ───────────────────────────────────────────────────────
+# ── OpenAI Batch API helpers ──────────────────────────────────────────────────
 
-def build_requests(
+def build_batch_jsonl(
     pairs: list[tuple[str, int, str, str]]
-) -> list[Request]:
-    """pairs: [(query_id, company_id, query_text, company_text), ...]"""
-    out = []
+) -> str:
+    """Build JSONL string for OpenAI Batch API. pairs: [(query_id, company_id, query_text, company_text)]"""
+    lines = []
     for qid, cid, qt, ct in pairs:
-        out.append(Request(
-            custom_id=f"{qid}__{cid}",
-            params=MessageCreateParamsNonStreaming(
-                model=LABEL_MODEL,
-                max_tokens=4,
-                system=SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": _user_prompt(qt, ct)}],
-            ),
-        ))
-    return out
+        lines.append(json.dumps({
+            "custom_id": f"{qid}__{cid}",
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": LABEL_MODEL,
+                "max_tokens": 4,
+                "temperature": 0,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": _user_prompt(qt, ct)},
+                ],
+            },
+        }))
+    return "\n".join(lines)
 
 
 def submit_and_poll(
-    client: anthropic.Anthropic, requests: list[Request]
+    client: openai.OpenAI, pairs: list[tuple[str, int, str, str]]
 ) -> dict[str, int]:
     """Submit batch, poll to completion, return {custom_id: label} dict."""
-    print(f"Submitting {len(requests)} requests to Batches API...", flush=True)
-    batch = client.messages.batches.create(requests=requests)
-    BATCH_ID_FILE.write_text(batch.id)
-    print(f"Batch ID: {batch.id}  (saved to {BATCH_ID_FILE})", flush=True)
+
+    # Resume if a previous batch is in progress
+    if BATCH_ID_FILE.exists():
+        batch_id = BATCH_ID_FILE.read_text().strip()
+        print(f"Resuming batch {batch_id} ...", flush=True)
+    else:
+        jsonl_content = build_batch_jsonl(pairs)
+        print(f"Uploading {len(pairs)} requests to OpenAI Batch API...", flush=True)
+        file_obj = client.files.create(
+            file=("batch_input.jsonl", io.BytesIO(jsonl_content.encode())),
+            purpose="batch",
+        )
+        batch = client.batches.create(
+            input_file_id=file_obj.id,
+            endpoint="/v1/chat/completions",
+            completion_window="24h",
+        )
+        batch_id = batch.id
+        BATCH_ID_FILE.write_text(batch_id)
+        print(f"Batch ID: {batch_id}  (saved to {BATCH_ID_FILE})", flush=True)
 
     while True:
-        batch = client.messages.batches.retrieve(batch.id)
+        try:
+            batch = client.batches.retrieve(batch_id)
+        except Exception as e:
+            print(f"  [WARN] Poll error ({e}), retrying in 30s...", flush=True)
+            time.sleep(30)
+            continue
         c = batch.request_counts
         print(
-            f"  {batch.processing_status}  "
-            f"processing={c.processing}  succeeded={c.succeeded}  errored={c.errored}",
+            f"  {batch.status}  "
+            f"total={c.total}  completed={c.completed}  failed={c.failed}",
             flush=True,
         )
-        if batch.processing_status == "ended":
+        if batch.status in ("completed", "failed", "expired", "cancelled"):
             break
         time.sleep(30)
 
+    if batch.status != "completed":
+        raise RuntimeError(f"Batch ended with status: {batch.status}")
+
+    # Download results
+    result_file = client.files.content(batch.output_file_id)
     labels: dict[str, int] = {}
-    for result in client.messages.batches.results(batch.id):
-        if result.result.type != "succeeded":
+    for line in result_file.text.splitlines():
+        if not line.strip():
             continue
-        text = next(
-            (b.text for b in result.result.message.content if b.type == "text"), ""
-        ).strip()
-        if text in ("0", "1", "2", "3"):
-            labels[result.custom_id] = int(text)
+        item = json.loads(line)
+        custom_id = item.get("custom_id", "")
+        try:
+            text = item["response"]["body"]["choices"][0]["message"]["content"].strip()
+            if text in ("0", "1", "2", "3"):
+                labels[custom_id] = int(text)
+        except (KeyError, IndexError):
+            continue
 
     BATCH_ID_FILE.unlink(missing_ok=True)
     print(f"Received {len(labels)} valid labels.", flush=True)
@@ -262,7 +296,7 @@ def submit_and_poll(
 
 def main() -> None:
     engine = RankingEngine()
-    client = anthropic.Anthropic()
+    client = openai.OpenAI()
 
     # ── Build candidate pairs ──
     print("Building candidate pairs...", flush=True)
@@ -292,14 +326,13 @@ def main() -> None:
 
     print(f"\nTotal pairs to label: {len(pairs)}", flush=True)
 
-    # ── Submit in chunks (Batches API max = 100k per batch) ──
+    # ── Submit in chunks (OpenAI Batch API max = 50k requests per batch) ──
     BATCH_CHUNK = 10_000
     all_labels: dict[str, int] = {}
     for i in range(0, len(pairs), BATCH_CHUNK):
         chunk = pairs[i : i + BATCH_CHUNK]
         print(f"\nChunk {i // BATCH_CHUNK + 1}: {len(chunk)} pairs", flush=True)
-        reqs   = build_requests(chunk)
-        labels = submit_and_poll(client, reqs)
+        labels = submit_and_poll(client, chunk)
         all_labels.update(labels)
 
     # ── Write labels.jsonl ──

@@ -1,0 +1,13 @@
+{
+  "structured_score": 99.12056427262723,
+  "bm25_norm": 49.88197607011534,
+  "keyword_overlap": 42.761099092662334,
+  "cosine_sim": 42.21580387133872,
+  "location_score": 22.739295154809952,
+  "recency": 18.774426707997918,
+  "is_public": 8.638007581233978,
+  "size_score": 1.9427530020475388,
+  "has_employees": 0.9962550103664398,
+  "industry_score": 0.0,
+  "has_revenue": 0.0
+}
