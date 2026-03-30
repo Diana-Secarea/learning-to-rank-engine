@@ -11,6 +11,15 @@ You will also need an OpenAi api key.
 Fallback: cross-encoder re-ranking
 ----------
 
+To see qualification :
+    File     │             Shows verdict?             │              How it uses the engine              │
+  ├─────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ solution.py │ Yes — calls validate() on every result │ Runs all SAMPLE_QUERIES (or args you pass)       │
+  ├─────────────┼────────────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ main.py     │ No                                     │ Interactive prompt, prints only the top-1 result │
+
+---------------
+
 The first part that I find the most important is to take a look on the dataset that was offered. I can see the dataset is big, so we need to analyze it and pre-process it in order to be as accurate as possible for the process of ranking and re-ranking that we will do further. Therefore, I took a look on the dataset and made this observations:
 
 ## data_cleaning.py
@@ -1263,3 +1272,112 @@ venv/bin/python naics_inference.py
 ```
 
 Each script is self-contained. The dataset (`companies_clean.jsonl`) is never modified after step 3.
+
+
+## QUALIFICATION
+How QUALIFIED / DISQUALIFIED works
+
+  The verdict comes from cross_validation.py's validate() function, called at the end of each query in
+  solution.py:1113-1116.
+
+  The decision logic (cross_validation.py:318-341)
+
+  confidence = 1.0
+  confidence -= 0.15 × (# internal consistency flags)   ← company's own data is weird
+  confidence -= 0.35 × (# query plausibility flags)     ← company is wrong for this query
+
+  is_plausible = confidence >= 0.5  AND  len(query_flags) == 0
+
+  A single query plausibility flag is enough to DISQUALIFY — even if confidence is still 0.65.
+
+  What triggers a flag
+
+  Internal consistency (_check_internal_consistency) — checks the company against itself:
+  - NAICS says "software" but no tech words anywhere in the description
+  - NAICS says "manufacturing" but business model is purely Retail/E-commerce
+  - NAICS says "logistics" but no logistics words in the profile
+
+  Query plausibility (_check_query_plausibility) — checks the company against the query's intent, driven by
+  QUERY_INTENT_RULES:
+  - Query says "saas" → company must be NAICS 511x/513x/518x/541x
+  - Query says "logistics" → company must be NAICS 484/488/493
+  - Query says "manufacturing" → company must be NAICS 31–33
+  - Query says "fintech" → finance NAICS + must have tech signals in text
+  - Query says "packaging" → NAICS 322x/326x AND must not be a cosmetics brand itself
+
+example:
+======================================================================
+     Query: SaaS companies in the logistics industry
+     ======================================================================
+     [WARN] Query expansion failed (The api_key client option must be set either by passing api_key to the client or by
+     setting the OPENAI_API_KEY environment variable), using original query.
+     [WARN] LLM rerank failed (The api_key client option must be set either by passing api_key to the client or by setting the
+      OPENAI_API_KEY environment variable), falling back to cross-encoder.
+       [CV] demoted: Jooma (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+     Expected NAICS 484/488/493 or similar.']
+       [CV] demoted: Aquarium (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+     Expected NAICS 484/488/493 or similar.']
+       [CV] demoted: uMan Xpert (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+      Expected NAICS 484/488/493 or similar.']
+       [CV] demoted: NOVRH (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+     Expected NAICS 484/488/493 or similar.']
+       [CV] demoted: Personio (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+     Expected NAICS 484/488/493 or similar.']
+       [CV] demoted: Asys (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+     Expected NAICS 484/488/493 or similar.']
+       [CV] demoted: Microtis (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+     Expected NAICS 484/488/493 or similar.']
+       [CV] demoted: Sesame HR (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+     Expected NAICS 484/488/493 or similar.']
+       [CV] demoted: Sesame HR (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+     Expected NAICS 484/488/493 or similar.']
+       [CV] demoted: Sesame HR (conf=0.65) ['Company NAICS 513210 (software publishers) is not a logistics/transport company.
+     Expected NAICS 484/488/493 or similar.']
+        1. Jooma                                [FR] emp=      4  rev=$    0.3M  private  score=-0.348
+           Software Publishers
+           Jooma is a French company specialized in digital HR and payroll management services, offering [...]
+           [DISQUALIFIED  conf=0.65]
+           ⚠  Company NAICS 513210 (software publishers) is not a logistics/transport company. Expected NAICS 484/488/493 or
+     similar.
+        2. Aquarium                             [US] emp=     13  rev=$    3.2M  private  score=-0.635
+           Software Publishers
+           Aquarium is a United States software company specializing in machine learning data operations [...]
+           [DISQUALIFIED  conf=0.65]
+           ⚠  Company NAICS 513210 (software publishers) is not a logistics/transport company. Expected NAICS 484/488/493 or
+     similar.
+        3. uMan Xpert                           [PT] emp=     29  rev=$    3.2M  private  score=-1.159
+           Software Publishers
+           uMan Xpert is a Portuguese software company specialized in Human Resources Management (HRM) [...]
+           [DISQUALIFIED  conf=0.65]
+           ⚠  Company NAICS 513210 (software publishers) is not a logistics/transport company. Expected NAICS 484/488/493 or
+     similar.
+        4. NOVRH                                [FR] emp=     63  rev=$   13.1M  private  score=-1.192
+           Software Publishers
+           NOVRH is a French company specialized in the development and integration of SIRH (Système [...]
+           [DISQUALIFIED  conf=0.65]
+           ⚠  Company NAICS 513210 (software publishers) is not a logistics/transport company. Expected NAICS 484/488/493 or
+     similar.
+        5. Personio                             [DE] emp=      ?  rev=         ?  private  score=-1.638
+           Software Publishers
+           Personio is a German information technology company specialized in employee management [...]
+           [DISQUALIFIED  conf=0.65]
+           ⚠  Company NAICS 513210 (software publishers) is not a logistics/transport company. Expected NAICS 484/488/493 or
+     similar.
+        6. Asys                                 [FR] emp=    200  rev=$   41.6M  private  score=-2.636
+           Software Publishers
+           Asys is a French software publisher specialized in human resources (HR) management software. [...]
+           [DISQUALIFIED  conf=0.65]
+           ⚠  Company NAICS 513210 (software publishers) is not a logistics/transport company. Expected NAICS 484/488/493 or
+     similar.
+        7. Microtis                             [LU] emp=     16  rev=$    9.0M  private  score=-6.179
+           Software Publishers
+           Microtis S.A., DBA Microtis, is a Luxembourgish software company specialized in the design and [...]
+           [DISQUALIFIED  conf=0.65]
+           ⚠  Company NAICS 513210 (software publishers) is not a logistics/transport company. Expected NAICS 484/488/493 or
+     similar.
+        8. Sesame HR                            [ES] emp=      ?  rev=$   35.5M  private  score=-7.856
+           Software Publishers
+           SESAME LABS, S.L., DBA Sesame HR, is a Spanish company specialized in human resources software [...]
+           [DISQUALIFIED  conf=0.65]
+           ⚠  Company NAICS 513210 (software publishers) is not a logistics/transport company. Expected NAICS 484/488/493 or
+     similar.

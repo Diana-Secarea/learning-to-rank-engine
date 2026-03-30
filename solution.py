@@ -25,6 +25,7 @@ import numpy as np
 from rank_bm25 import BM25Okapi
 from sentence_transformers import CrossEncoder, SentenceTransformer
 
+from cross_validation import validate
 from text_to_embed import company_to_text
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -1107,5 +1108,14 @@ if __name__ == "__main__":
         if not results:
             print("  (no results)")
         else:
+            qualified = 0
             for r in results:
+                vr = validate(query, r)
+                verdict = "QUALIFIED  " if vr.is_plausible else "DISQUALIFIED"
                 print(_fmt_result(r))
+                print(f"      [{verdict}  conf={vr.confidence:.2f}]")
+                for flag in vr.flags:
+                    print(f"      ⚠  {flag}")
+                if vr.is_plausible:
+                    qualified += 1
+            print(f"\n  Summary: {qualified}/{len(results)} qualified")
