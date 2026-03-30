@@ -1,11 +1,19 @@
 # WRITEUP — Company Ranking & Qualification System
 
+## HOW TO USE IT: entry- point
+You run it as:
+  python main.py
+Then it prompts you interactively:
+Search for companies: for example - fintech startup in London with 500 employees
+You type your query and press Enter.
+
+You will also need an OpenAi api key.
+Fallback: cross-encoder re-ranking
+----------
 
 The first part that I find the most important is to take a look on the dataset that was offered. I can see the dataset is big, so we need to analyze it and pre-process it in order to be as accurate as possible for the process of ranking and re-ranking that we will do further. Therefore, I took a look on the dataset and made this observations:
 
 ## data_cleaning.py
-
-The first part that I find the most important is to take a look on the dataset that was offered. I can see the dataset is big, so we need to analyze it and pre-process it in order to be as accurate as possible for the process of ranking and re-ranking that we will do further. Therefore, I took a look on the dataset and made this observations:
 
 Before the pipeline can run, `companies.jsonl` needs to be cleaned. This script takes the raw file and produces `companies_clean.jsonl` in four passes:
 
@@ -25,6 +33,22 @@ Two things immediately looked wrong:
 To JSON, this is perfectly valid — it's just a string value that happens to look like a dict. No error is raised. The bug is invisible unless you actually check isinstance(value, dict) after parsing. So if we write code like record['address']['country_code'] it would crash with TypeError: string indices must be integers. We need to change it .
 
 
+Fix that I used:
+
+```python
+import ast
+
+def parse_dict_field(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.startswith('{'):
+        return ast.literal_eval(value)  # handles Python single-quote dicts
+    return value
+
+record['address'] = parse_dict_field(record['address'])
+record['primary_naics'] = parse_dict_field(record['primary_naics'])
+
+
 **Pass 2 — Deduplicate by website (`dedup_by_website`)**
 
 13 websites appear exactly twice with byte-for-byte identical records. Website is used as the dedup key — it's more stable and unique than company name. If two records share a website, the one with more non-null fields is kept. Records with no website are passed through unchanged.
@@ -42,9 +66,34 @@ Some of them being:
      sol-ind.com: ['Sol Industries', 'Sol Industries']
 Those are 100% identical records — every single field is the same. Pure copy-paste duplicates in the dataset. Safe to just drop one of each, no merging needed.
 
+I used website as the primary dedup key, keeping the record with more non-null fields:
+
+```python
+def count_fields(record: dict) -> int:
+    return sum(1 for v in record.values() if v is not None)
+
+def dedup_by_website(records: list) -> list:
+    seen = {}
+    no_website = []
+    for r in records:
+        key = (r.get("website") or "").lower().strip()
+        if not key:
+            no_website.append(r)
+            continue
+        if key not in seen:
+            seen[key] = r
+        else:
+            if count_fields(r) > count_fields(seen[key]):
+                seen[key] = r
+    return list(seen.values()) + no_website
+```
+
+Then I discovered a second problem: 7 pairs of duplicate descriptions — Rögle Vindkraftpark, Enercon, MantaWind, etc. — identical descriptions, no website to dedup on. `dedup_by_website` skipped them because they have no website key. Added `dedup_by_description` as a second pass in `data_cleaning.py`
+
 **Pass 3 — Deduplicate by description (`dedup_by_description`)**
 
 7 companies have no website and identical descriptions — Rögle Vindkraftpark, Enercon, MantaWind, etc. These slipped through the website dedup. A second pass uses description as the fallback key to catch them.
+
 
 **Pass 4 — Drop `secondary_naics` (`drop_feature_fields`)**
 
@@ -77,109 +126,16 @@ Now we will ask ourselves, do we need to guess a value based on the industry or 
 Basically, the problem will be for  - "fast-growing companies" — revenue is needed to infer growth. We will ask ourselves if it is relevant for a query that requires employee count or revenue.
 We will leave it as such for the moment.
 
----
-
-## Development Notes
-
-The first part that I find the most important is to take a look on the dataset that was offered. I can see the dataset is big, so we need to analyze it and pre-process it in order to be as accurate as possible for the process of ranking and re-ranking that we will do further. Therefore, I took a look on the dataset and made this observations:
-
-### DATA CLEANING
-
-**1. Invalid JSON structure**
-
-Looking at the first line of the JSON file, I have identified that we are passing the address like this:
-
-```
-"year_founded":null,"address":"{'country_code': 'ro', 'latitude': 44.4792186, 'longitude': 26.1045773, 'region_name': 'Bucharest', 'town': 'Bucharest'}"
-```
-
-Two things immediately looked wrong:
-- The value is a string (wrapped in `"`), not an object.
-- Inside that string, the quotes are single quotes (`'`), not double quotes. Valid JSON only uses double quotes — so this is Python `repr()` output, not JSON.
-
-To JSON, this is perfectly valid — it's just a string value that happens to look like a dict. No error is raised. The bug is invisible unless you actually check `isinstance(value, dict)` after parsing. So if we write code like `record['address']['country_code']` it would crash with `TypeError: string indices must be integers`. We need to change it.
-
-Fix that I used:
-
-```python
-import ast
-
-def parse_dict_field(value):
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str) and value.startswith('{'):
-        return ast.literal_eval(value)  # handles Python single-quote dicts
-    return value
-
-record['address'] = parse_dict_field(record['address'])
-record['primary_naics'] = parse_dict_field(record['primary_naics'])
-```
-
-**2. Duplicates (25 name duplicates, 13 website duplicates)**
-
-I checked the data by grouping records by website and comparing fields. I realized there are many companies that share the same website and the same name:
-
-```
-wavedragon.com:       ['Wave Dragon', 'Wave Dragon']
-norhybrid.com:        ['Norhybrid Renewables', 'Norhybrid Renewables']
-teslaoceanturbine.com:['Tesla Ocean Turbine', 'Tesla Ocean Turbine']
-windainergy.com:      ['windainergy', 'windainergy']
-cktl.se:              ['Carita och Torbjörn', 'Carita och Torbjörn']
-nextfabrication.com:  ['Next Fabrication', 'Next Fabrication']
-worldwidewind.no:     ['World Wide Wind', 'World Wide Wind']
-cirkelenergi.dk:      ['CIRKEL Energi', 'CIRKEL Energi']
-windspider.com:       ['WindSpider', 'WindSpider']
-sol-ind.com:          ['Sol Industries', 'Sol Industries']
-vindparken.se:        ['Erikshester Vindpark', 'Erikshester Vindpark']
-teunhulst.nl:         ['Logic-Energy', 'Logic-Energy']
-fredolsen1848.com:    ['Fred. Olsen 1848', 'Fred. Olsen 1848']
-```
-
-Those are 100% identical records — every single field is the same. Pure copy-paste duplicates in the dataset. Safe to just drop one of each, no merging needed. I used website as the primary dedup key, keeping the record with more non-null fields:
-
-```python
-def count_fields(record: dict) -> int:
-    return sum(1 for v in record.values() if v is not None)
-
-def dedup_by_website(records: list) -> list:
-    seen = {}
-    no_website = []
-    for r in records:
-        key = (r.get("website") or "").lower().strip()
-        if not key:
-            no_website.append(r)
-            continue
-        if key not in seen:
-            seen[key] = r
-        else:
-            if count_fields(r) > count_fields(seen[key]):
-                seen[key] = r
-    return list(seen.values()) + no_website
-```
-
-Then I discovered a second problem: 7 pairs of duplicate descriptions — Rögle Vindkraftpark, Enercon, MantaWind, etc. — identical descriptions, no website to dedup on. `dedup_by_website` skipped them because they have no website key. Added `dedup_by_description` as a second pass in `data_cleaning.py`.
-
-**3. Missing Numerical Fields — employee_count (39.4%) and revenue (19.5%)**
 
 ```python
 missing_emp = sum(1 for r in records if r.get('employee_count') is None)
 print(f'Missing employee_count: {missing_emp} ({missing_emp/n*100:.1f}%)')
 ```
 
-39% of companies have no employee_count, 19% have no revenue. These are potentially strong ranking signals but have significant missingness. Dropping records or using a global mean would distort rankings.
-
-Strategies I considered:
-1. NAICS-group median imputation — impute missing values with the median of companies sharing the same `primary_naics.code`. Sector-aware and more accurate than a global median.
-2. Size-bucket encoding — encode employee_count as an ordinal bucket (micro/small/medium/large/enterprise). Treat missing as its own unknown category.
-3. Missingness indicator — add a boolean `employee_count_known` alongside the imputed value so the model can learn that imputed values are less reliable.
-
 Decision: leave as-is for now. The hard filter already handles missing = benefit of doubt, and the LLM reranker can reason about company size from descriptions.
 
-**4. secondary_naics — 97.7% Missing**
 
-Only 11 of 477 records have a non-null `secondary_naics`. It cannot be used as a reliable signal. Dropped it from any feature vector — keeping it would accidentally uprank or downrank those 11 companies based on a field 97.7% of companies don't have.
-
-**5. Noisy list fields**
+**Noisy list fields**
 
 `core_offerings` goes up to 18 items, `target_markets` up to 31 items. A wall of 31 generic market labels dilutes the meaningful ones when embedding. I only implemented the length cap (applied at embedding time in `solution.py`, not baked into `companies_clean.jsonl`), skipped deduplication within lists (zero actual duplicates existed) and normalization (the embedding model handles casing internally).
 
@@ -308,6 +264,7 @@ Results where expansion helped:
 
 Query expansion is one extra API call per query, cached on repeat. It surfaces 1–2 new correct companies per query on average without hurting anything.
 
+## SOLUTION.PY
 
 ## 3.1 Approach
 
@@ -341,7 +298,7 @@ Top-10 results, deduplicated
 
 Regex + spaCy extracts structured constraints from the natural language query:
 
-- **Geography**: country names and region names (DACH, Europe, Nordics, etc.) → ISO-2 country codes
+- **Geography**: country names and region names (DACH, Europe, Nordics, etc.) → ISO-2 country codes. City names ("London", "Berlin", "San Francisco", etc.) are also matched via a CITY_MAP of ~100 major cities. A matched city is stored in `q.city_names` and also adds its country to `q.country_codes`, so the hard filter still works unchanged. City matching is soft — it only affects scoring, not elimination — because `town` field values can have slight variations. In `_score_location`, an exact city match scores 1.0, right country but wrong city scores 0.7, and right region but wrong city is neutral (0.5).
 - **Size**: employee count ranges, qualitative hints ("startup" → max 200, "enterprise" → min 1000)
 - **Revenue**: min/max thresholds from phrases like "revenue over $50M"
 - **Public/private** flag
@@ -425,12 +382,104 @@ Binary pass/fail — runs before any ML. It removes companies that definitely do
   ├────────────────┼────────┼───────────────────────────────────────┤
   │ Size           │ 0.10   │ Employee/revenue fit                  │
   ├────────────────┼────────┼───────────────────────────────────────┤
-  │ Recency        │ 0.05   │ How recently founded                  │
+  │ Recency        │ 0.05   │ How recently founded (query-aware)    │
   └────────────────┴────────┴───────────────────────────────────────┘
+
+  The recency scorer is query-aware: it only activates when the query carries an explicit year signal (`year_founded_min` or `year_founded_max`). With no year signal it returns 0.5 (neutral) — so queries like "Find logistics companies in Germany" don't silently bias toward newer companies. When a minimum is set (e.g. "startups", "founded after 2018") it rewards newer companies. When a maximum is set (e.g. "established", "founded before 2000") it rewards older companies. When both bounds are set it scores 1.0 inside the window and decays toward 0.0 outside proportional to distance from the nearest bound.
 
   So hard filter is a gate (in or out), and the structured score is a ranking signal — companies that partially match on
    geography or industry still get through but score lower.
 
+### Multi-label and many-to-many attribute mapping
+
+A company is never forced into a single label. Every attribute in the pipeline is treated as a set, not a scalar, and matching is always intersection-based:
+
+- **Business model** (`business_model` field) is a list — a company can be simultaneously `["Business-to-Business", "Software-as-a-Service", "Subscription-Based"]`. The hard filter checks whether the query's requested business models intersect with the company's set. A company matching on *any* of the query's models passes. The LLM reranker then assesses how well the full profile matches the full query intent — it is not forced to pick one dimension.
+
+- **NAICS prefixes** are also a list in the intent parser — a query like "fintech" expands to `["522", "5221", "5222", "5223", "5112", "5132", "5415", "518"]`, covering both finance and software sectors simultaneously. A company matching any one of these prefixes gets a full industry score of 1.0, not a partial score for "only matching some of the intent."
+
+- **Geography** is a set of ISO-2 codes — "Europe" expands to 35 country codes, and a company in any of them passes. A query specifying both a region ("Europe") and a country ("Germany") correctly results in a set that satisfies either.
+
+- **The cross-validation module** (`cross_validation.py`) applies a many-to-many mapping in reverse: given a company's NAICS code, it checks whether the company's business model is consistent with *all* expected business models for that sector — not just one. A NAICS 5132 (Software) company is expected to carry *at least one* of `{SaaS, B2B, Subscription, Enterprise, B2C}`. If it has none, it is flagged as internally inconsistent regardless of what the query says.
+
+This design means the pipeline correctly handles companies that genuinely operate across multiple industries or business models — a company classified as both logistics and warehousing, or both SaaS and B2B, will match queries that request either or both, and will not be arbitrarily collapsed to a single label.
+
+### `naics_inference.py` — Secondary NAICS labels from core_offerings
+
+Every company in the dataset has exactly one `primary_naics` code . That code reflects what the company *is categorised as*, not necessarily everything it *does*. A fintech company whose primary NAICS is `522320` (Financial Transactions Processing) also builds software products, but its single NAICS code gives it an industry score of 0.0 for any "SaaS" or "software" query. This is a systematic gap: companies that operate at the intersection of two industries are penalised for having been classified into only one of them.
+So there are many companies that can be assigned with many labells not just one. Maybe one is more accurate than the others but it does not mean we have to reject the others.
+
+**How it works.**
+`naics_inference.py` defines a `NAICS_INFERENCE_MAP` — a separate, conservative dictionary that maps specific multi-word phrases to NAICS prefixes. The phrases are grounded in the actual `core_offerings` strings present in the dataset (e.g. `"payroll management software"`, `"freight rail transport"`, `"wind turbine manufacturing"`). At startup, the function `infer_naics_from_offerings(r)` scans each company's `core_offerings` list against this map and returns a list of inferred NAICS prefixes. These are stored as `_inferred_naics` on the in-memory record dict.
+
+The scoring logic can then check both the primary NAICS and the inferred ones:
+
+```python
+# primary match → 1.0 (authoritative classification)
+# inferred match → 0.85 (company does this, but it is not its official sector)
+```
+
+**What went wrong when I first built this inside `solution.py`.**
+The first implementation added the inference directly into `_score_industry`, using `NAICS_MAP` — the same map already used to parse queries. The logic was: scan each company's `core_offerings` at init time, store inferred prefixes on the record, and in `_score_industry` return 0.85 if any inferred prefix matched the query instead of 0.0. Conceptually sound. In practice, a disaster.
+
+Running it against the evaluation queries showed:
+
+- **"B2B SaaS"** — 147 out of 457 companies gained a 0.85 industry score. The examples: Romgaz (natural gas extraction), METRO România (wholesale grocery), Transgaz (gas distribution). None are SaaS companies.
+- **"fintech in Europe"** — 111 companies gained the score, most of them unrelated to finance or software.
+
+The root cause was immediately clear: `NAICS_MAP` was designed for *query parsing*, where broad recall is correct — you want a user typing "transportation" to match every logistics-adjacent company. But for *company labeling*, that same breadth becomes poison. The word `"Transportation"` appearing in an offering string like `"Technological Transportation Services"` is not evidence that a company is a trucking company. `"Gas"` in `"Gas Balancing and Risk Management"` is not evidence of oil and gas operations. With single-word keywords, almost every company's offerings contain enough surface matches to collect logistics, manufacturing, and software codes simultaneously — the labels become meaningless.
+
+I reverted `_score_industry` to its original form and pulled the inference logic out of `solution.py` entirely. The core pipeline is not affected. The dataset is not affected. The idea itself is valid — it just requires a stricter, purpose-built map.
+
+**Why a separate map, not NAICS_MAP.**
+`NAICS_INFERENCE_MAP` uses only compound phrases — no single generic words. Each entry requires a specific term that unambiguously identifies the industry. `"freight rail transport"` only matches actual rail freight companies. `"payroll management software"` only matches payroll software companies. The result: 192 companies gain new labels (down from 442), and every example is defensible — CFR gains `482110` (freight rail) because its offerings explicitly include `"Freight Rail Transport Services"`, not because the word "transport" appeared incidentally.
+
+**Why it is not in `solution.py`.**
+Keeping it separate was a deliberate choice after the failed first attempt. It makes the boundary explicit: `solution.py` is the core pipeline, and its behaviour on the evaluation queries is known and measured. `naics_inference.py` is an enrichment module that is not yet wired in — it can be audited independently by running `python naics_inference.py` to inspect exactly which labels get inferred for which companies, iterated on without risking regressions in the main pipeline, and integrated once the output quality is confirmed against the full query set. The dataset (`companies_clean.jsonl`) is never touched — `_inferred_naics` would live only in RAM at runtime, disappearing when the process exits.
+
+**Coverage on this dataset.**
+- 192 companies gain at least one new inferred label beyond their primary NAICS
+- 202 companies match no phrases (typically companies with generic or missing offerings)
+- 63 companies already have their primary NAICS covered by the inferred set (no new information)
+
+As mentioned earlier, this is a standalone tool for the moment. The future improvement on a bigger dataset will be to be integrated with solution.py.
+
+ The three lines to wire it in:
+
+  # top of solution.py
+  from naics_inference import infer_naics_from_offerings
+
+  # in RankingEngine.__init__, after loading records
+  for r in self.records:
+      r["_inferred_naics"] = infer_naics_from_offerings(r)
+
+  # in _score_industry, after the primary NAICS check
+  inferred = r.get("_inferred_naics") or []
+  if inferred and any(any(inf.startswith(p) for p in q.naics_prefixes) for inf in inferred):
+      return 0.85
+
+I have ran tests in order to see if this solution.py is better to be integrated inside solution.py and the tests failed. 
+ ┌────────────┬──────────┬────────────────┬────────┐
+  │   Metric   │ Baseline │ With Inference │ Delta  │
+  ├────────────┼──────────┼────────────────┼────────┤
+  │ NDCG@5     │ 0.7292   │ 0.6487         │ -0.081 │
+  ├────────────┼──────────┼────────────────┼────────┤
+  │ NDCG@10    │ 0.7761   │ 0.7424         │ -0.034 │
+  ├────────────┼──────────┼────────────────┼────────┤
+  │ MAP@10     │ 0.7238   │ 0.6823         │ -0.042 │
+  ├────────────┼──────────┼────────────────┼────────┤
+  │ MRR        │ 0.7778   │ 0.7778         │ 0.000  │
+  ├────────────┼──────────┼────────────────┼────────┤
+  │ mean_judge │ 1.4583   │ 1.3000         │ -0.158 │
+  ├────────────┼──────────┼────────────────┼────────┤
+  │ ROC-AUC    │ 0.8438   │ 0.7452         │ -0.099 │
+  └────────────┴──────────┴────────────────┴────────┘
+
+  Verdict: The inferred NAICS labels let through companies that the LLM reranker correctly penalizes — so more candidates pass the
+  industry filter but they're lower quality. The compound-phrase map isn't precise enough to reliably identify true industry
+  matches; false positives crowd out true positives.
+
+  This is a place where the system is failling and we need to further investigate into this. It is something that needs to be prioritised as it represents a real problem: there are companies that can fit many labells and having a good, aware clasification that takes everything into account is really important.
 
 ### Stage 3 — FAISS + BM25 → RRF
 
@@ -618,6 +667,33 @@ A company that is a genuine 1.5 on the 0–3 scale will receive either 1 or 2 de
 
 ---
 
+## 3.6 Future Improvements
+
+The current system works well for the 457-company dataset and the 12 evaluation queries. These are the concrete next steps, ordered by expected impact.
+
+**1. Confidence thresholding — stop surfacing zero-score results.**
+The pipeline currently returns the top-10 results regardless of their LLM reranker scores. For queries like "Find logistics companies in Germany", the top result scores 0 — the LLM itself is saying "this is not a match." The system should detect when all top-K results score ≤ 1 and respond with "No confident matches found" rather than showing misleading results. A `max_score < 2` threshold on the top-10 LLM scores would catch this pattern. This is the single highest-impact improvement because it directly affects user trust.
+
+**2. NAICS taxonomy versioning.**
+The NAICS classification system was revised in 2022. The dataset uses 2022 codes (e.g. `513210` for Software Publishers), but the NAICS_MAP was originally built with 2017 codes (`511210`). This caused the industry soft-score to silently return 0.0 for 64 SaaS companies — they had the right industry but the wrong code version. The fix (adding `5132`/`513210` to all software-related entries) was applied during this project, but the same version mismatch likely exists for other sectors that were not tested. A systematic audit of all NAICS_MAP entries against the 2022 taxonomy is needed.
+
+**3. BM25 tokenization upgrade.**
+The current BM25 index tokenizes text with a plain `str.lower().split()`. This means "logistics" and "logistical" are different tokens, "the" and "in" contribute noise to scores, and compound terms like "supply chain" are split. The spaCy pipeline is already loaded in the codebase for intent parsing — using it to lemmatize tokens and remove stop words before BM25 indexing would improve keyword recall at zero additional infrastructure cost.
+
+**4. LLM reranker prompt hardening for ambiguous industry queries.**
+The reranker prompt currently instructs the model to be strict, but gives no explicit guidance on edge cases like "is a commodity distributor a logistics company?" or "is a currency exchange a fintech company?". These borderline cases produce inconsistent scores across runs. Adding explicit disambiguation examples to the system prompt — few-shot examples of border cases with correct scores and reasoning — would make the scoring more deterministic and reduce rank variance at positions 5–10.
+
+**5. Confidence-aware deduplication.**
+The current deduplication is name-based (`operational_name` exact match). Two records for the same legal entity with slightly different names (e.g. "Rompetrol" and "Rompetrol Group") will both appear in results. A fuzzy deduplication step using edit distance or embedding cosine similarity between company names, combined with same-website matching, would eliminate this class of duplicates.
+
+**6. Structured output from the LLM reranker.**
+The reranker currently returns integer scores (0–3) with no explanation. Requesting a one-sentence reason alongside each score (`{"id": 1, "score": 2, "reason": "..."}`) would make the pipeline auditable and debuggable without significant token cost. It also enables automatic detection of systematic reranker errors — if 8 out of 10 results have `reason` containing "distribution interpreted as logistics", that's a known failure mode that can be patched in the prompt.
+
+**7. At scale: replace the hard filter with a SQL index.**
+The linear scan over all records is `O(n)`. At 457 companies this takes ~1ms. At 100K companies it takes ~200ms and dominates query latency. Moving the hard filter to a SQL `WHERE` clause over indexed columns (`country_code`, `employee_count`, `revenue`, `is_public`, `year_founded`, `naics_code`) drops this to ~1ms regardless of corpus size. The filter logic maps directly to SQL — no architectural change needed.
+
+---
+
 
 ---
 
@@ -710,9 +786,23 @@ The dataset is too small now to use this model but when I designed the arhitectu
 - **binary (≥ 2)** — relevant / not-relevant, used for MAP / P@K / ROC-AUC
 - **strict (= 3)** — highly relevant only, used for P@1\_strict / P@3\_strict
 
-### LLM judge
+### Validation strategy — why this works without ground truth
 
 Uses OpenAi mini -4 independently from the pipeline's own reranker (OpenAI `gpt-4o-mini`), so the evaluation is not self-referential. The judge sees the same company summaries but scores them without knowledge of how the pipeline ranked them. Since we have no grounding true, at least we have something that has the mind of a human that can properly review.
+
+There is no predefined ground truth for this dataset. No human has labeled which companies are correct answers to which queries. This is the standard situation in enterprise search and qualification tasks — you cannot enumerate all correct answers in advance. The validation strategy is designed to be rigorous despite this constraint.
+
+**LLM-as-judge with independence guarantee.** The evaluation judge is `gpt-4o` (not `gpt-4o-mini` used by the pipeline reranker). The judge sees the same company summaries as the reranker but has no knowledge of how the pipeline ranked them — it scores each company independently against the query. This independence is critical: if the same model both ranked and judged, it would trivially agree with itself. Using a different, stronger model as judge means the evaluation is measuring something real.
+
+**Why LLM judgment is a valid proxy.** The queries in this task require genuine semantic understanding — "is this company a packaging supplier for cosmetics brands?" cannot be answered by string matching or NAICS lookup alone. A human expert and a strong LLM will reach the same conclusion on clear cases (pharma company ≠ SaaS company) and will agree on roughly 80–90% of borderline cases. This is the same reliability level as human inter-annotator agreement on ambiguous retrieval tasks. The LLM judge is not a perfect ground truth, but it is a consistent, scalable, and semantically capable proxy — which is better than no evaluation at all.
+
+**Known biases and mitigations.** LLM judges have a positional bias (favor earlier items in a list) and a verbosity bias (favor longer descriptions). Both are mitigated here by presenting all 20 candidates in a fixed shuffled order and by using condensed 200-character summaries rather than full descriptions. The judge prompt explicitly instructs strict scoring — a pharma company is not a generic "manufacturing company" unless pharma is explicitly requested.
+
+**Ablation design as a robustness check.** Three ablations per query (LLM reranker, cross-encoder, stage3-only) are evaluated under identical conditions. If the judge were biased, it would affect all three equally — but the clear ranking (LLM > stage3 > cross-encoder) with consistent margins across metrics is unlikely to be an artifact of judge bias. The relative ordering between ablations is what matters for validating design decisions, and that ordering is robust.
+
+**Sampling strategy for production.** At scale, the recommended validation approach is: (1) stratified sampling — 10 queries per industry vertical × 3 difficulty levels = 30 queries; (2) dual scoring — LLM judge + 2 human reviewers on a 10% sample to measure LLM-human agreement; (3) disagreement analysis — when LLM and human disagree, root-cause whether it is a data gap, a prompt issue, or a genuine ambiguity. This provides a calibrated confidence interval on the NDCG scores.
+
+I really believe a human reviewer will be worthy in this context, because it can not go wrong.
 
 ### Three ablations per query
 
@@ -972,6 +1062,7 @@ I will send below a query to query analysis:
 
 
 ## Cross-Validation Module — cross_validation.py
+= to audit the pipeline for output quality.
 The pipeline's LLM reranker and cross-encoder are probabilistic — they can surface plausible-sounding but structurally wrong results. This validator adds a deterministic safety net that catches obvious mismatches cheaply, before they reach the user.
 
   A post-retrieval consistency checker that runs after the pipeline returns results. For every (query, company) pair, it
@@ -1049,3 +1140,126 @@ The pipeline's LLM reranker and cross-encoder are probabilistic — they can sur
   Cross-val pass rate         0.80           0.60         0.70   ← new
 
   This gives us a cheap proxy for precision that doesn't require LLM judge calls — you can run it on every query for free.
+
+  But here the query is hardcoded for the moment, so if you want to check a query, you need to include it in the solution.
+  run_demo() in cross_validation.py:343-350 — the queries are hardcoded in the file itself:
+
+  demo_queries = [
+      "Manufacturing companies in the DACH region founded before 2000",
+      "B2B SaaS companies with annual revenue over $10M",
+      "Companies that could supply packaging materials for a direct-to-consumer cosmetics brand",
+      ...
+  ]
+
+# Handling ambiguity
+This is why I am re-writing the query with an LLM. To avoid possible human errors that might appear.
+
+---
+
+## Assumptions
+
+Every system makes assumptions. These are mine, stated explicitly so they can be challenged.
+
+**The dataset is representative enough to evaluate on.** The 457-company dataset is heavily biased toward HR software, Swiss pharma, and renewable energy. I assume that a system performing well on this distribution gives some signal about how it would perform on a broader dataset — but I am aware this is a stretch. The F-grade queries (Germany logistics, DACH manufacturing) fail purely because the data does not contain those companies, not because the pipeline logic is wrong.
+
+**The LLM judge is a reliable proxy for human judgment.** There is no ground truth for this dataset. I use GPT-4o as an independent judge to score results. I assume GPT-4o and a human expert would agree on clear cases and disagree on roughly 10–20% of borderline cases — similar to human inter-annotator agreement on ambiguous retrieval tasks. If GPT-4o has a systematic bias (e.g. it always prefers larger companies), the NDCG scores would be inflated or deflated in a consistent direction.
+
+**Missing data means unknown, not absent.** When a company has no employee_count or no country code, I treat it as "we don't know" and let it pass the hard filter. This assumes that data gaps in the dataset are random, not systematic. If companies without a country code are systematically from one country (e.g. all unlabeled companies are Romanian), this assumption breaks and those companies would be unfairly surfaced for every geography query.
+
+**NAICS codes in the dataset use the 2022 revision.** The dataset uses codes like 513210 (Software Publishers under 2022 taxonomy). I discovered mid-project that my original NAICS_MAP was built with 2017 codes (511210). I updated the affected entries, but I assume no other sector-level mismatches remain. This has not been systematically audited for every NAICS branch.
+
+**The query expansion LLM describes the right industry.** Before FAISS search, GPT-4o-mini rewrites the query as a company description. I assume this expansion is directionally correct — pointing toward the right industry sector. If the query is ambiguous, the expansion might pick the wrong interpretation (e.g. expanding "energy companies in Norway" toward oil rather than renewables). The pipeline has no mechanism to detect or recover from a wrong expansion.
+
+**Temperature=0 is sufficient for determinism.** The LLM reranker does not explicitly set temperature in the current implementation. I assume the API defaults produce roughly consistent scores across runs. In practice, borderline cases (a company that is a genuine 1.5 on the 0–3 scale) will receive different scores on different runs, causing rank instability at positions 5–10.
+
+---
+
+## Where the system is strong and where it struggles
+
+**Where it works well.** Queries with a clear industry, a well-represented geography, and specific NAICS codes get excellent results. Pharmaceutical companies in Switzerland, French food manufacturers, EV battery component suppliers, packaging for cosmetics — these all score A. The pipeline handles multi-word semantic queries ("companies that manufacture or supply critical components for electric vehicle battery production") surprisingly well because FAISS picks up the right semantic cluster and the LLM reranker understands the nuance. The structured scoring layer also means that even without the LLM, stage3-only results are often reasonable — the handcrafted signals (NAICS match, location, size) are effective on this dataset.
+
+**Where it struggles.** The system fails in two distinct ways. The first is data gaps — if the relevant companies simply do not exist in the 457-record corpus, no pipeline can fix that. Germany logistics and DACH manufacturing are failures of coverage, not logic. The second is taxonomy ambiguity — NAICS "32" includes pharmaceutical manufacturing, so any "manufacturing" query surfaces Swiss pharma companies that correctly pass the NAICS filter. The LLM reranker catches most of these, but for ambiguous queries it is inconsistent.
+
+The long tail is the harder problem. Queries like "fast-growing fintech companies competing with traditional banks" have a weak signal in the data — there are very few fintech companies, and "fast-growing" has no reliable field to match on. The pipeline returns plausible-looking results that are structurally questionable (agri-finance companies, payment processors that are not banks-facing). These cases do not fail loudly — they fail silently with mediocre scores that look acceptable.
+
+**The single biggest fragility.** The system depends heavily on the LLM reranker. With the LLM, NDCG@5 is 0.73. Without it, using the cross-encoder fallback, NDCG@5 drops to 0.59. The structured score alone (stage3) is actually stronger than the cross-encoder (NDCG@5 0.66), which means the handcrafted features are more useful than the ms-marco model for this domain. But neither fallback matches the LLM. If the OpenAI API is unavailable, the pipeline degrades significantly. This is a known fragility that would need to be addressed before any production deployment.
+
+---
+
+## Query-side failure modes
+
+Most of the error analysis in this writeup focuses on data failures — what happens when the dataset does not contain the right companies. But the pipeline also fails when the query itself is problematic, independent of the data.
+
+**Extremely vague queries.** A query like "good companies in Europe" or "innovative businesses" gives the intent parser nothing to work with. No NAICS keywords, no size signal, no business model. The hard filter passes everything, FAISS ranks by generic semantic similarity to the word "innovative", and the LLM reranker has no criteria to discriminate on. The result is 10 companies that are topically close to the word "innovative" — which is meaningless.
+
+**Contradictory constraints.** A query like "startups founded before 1990" sets year_founded_min (from "startups" → recent) and year_founded_max (from "before 1990") simultaneously, creating a constraint that no company can satisfy. The spaCy dependency parser handles the "traditional banks" case correctly — but it only looks for specific context verbs ("competing with", "disrupting"). A query like "old-fashioned startups in the retail space" would still fire both year signals because "old-fashioned" is an adjective modifying the target, not a context subtree.
+
+**Queries about relationships, not attributes.** The Shopify query is the clearest example. "E-commerce companies using Shopify" asks about a technology relationship — what platform does a company use. No field in the dataset captures technology stack. The pipeline cannot answer this class of query honestly; it falls back to "companies that are broadly e-commerce adjacent." This is a structural impossibility, not a ranking failure, and the system does not currently communicate this distinction to the user.
+
+**Overly specific numeric thresholds.** A query like "companies with exactly 50 employees" or "revenue between $12M and $14M" is so narrow that the hard filter eliminates almost every company, and the tiered fallback then ignores the numeric constraint entirely. The user gets results with no relationship to their specified numbers. There is no feedback to the user explaining that the constraint was relaxed.
+
+---
+
+## How cross_validation.py reduces errors by design
+
+The LLM reranker and FAISS embeddings are probabilistic — they can surface results that look plausible but are structurally wrong. A pharma company with good semantic overlap with a "SaaS" query might score 2 out of 3 from the reranker if its description mentions "software tools" as a side product. The cross-validation module exists to catch exactly this pattern deterministically, without any LLM call.
+
+The design principle is simple: before a company reaches the user, check whether its own data is internally consistent, and whether it is a structurally plausible answer to this query. These are rule-based checks that run in milliseconds. If a company's NAICS code is 522320 (Financial Transactions Processing) and the query is "SaaS companies", the validator flags it — because that NAICS code is not a software publisher code regardless of what the company description says. This is not a probabilistic judgment; it is a structural fact about the taxonomy.
+
+This is different from what the hard filter does. The hard filter runs before retrieval and eliminates companies based on query constraints. The cross-validator runs after retrieval and checks the returned results for consistency. The hard filter asks "does this company contradict the query?" The cross-validator asks "does this company's own data make internal sense, and is it a structurally plausible answer to this query?" Together, they form two layers of error reduction — one before the expensive computation, one after.
+
+The concrete effect is visible in the pipeline output: `[CV] demoted: Paychex (conf=0.65)` and `[CV] demoted: Phin (conf=0.65)`. These companies passed the LLM reranker with scores above 0 but were flagged by the validator as structurally inconsistent with the query. Paychex has NAICS 541214 (payroll services, not software), and Phin has NAICS 522320 (financial transactions, not SaaS). The LLM found their descriptions relevant enough to include; the validator disagreed on structural grounds.
+
+---
+
+## End-to-end reproduction walkthrough
+
+To reproduce the full pipeline from scratch:
+
+**Step 1 — Install dependencies**
+```bash
+python -m venv venv
+venv/bin/pip install -r requirements.txt
+venv/bin/python -m spacy download en_core_web_sm
+```
+
+**Step 2 — Set your OpenAI API key**
+Create a `.env` file in the project root:
+```
+OPENAI_API_KEY=sk-...
+```
+
+**Step 3 — Clean the dataset**
+```bash
+venv/bin/python data_cleaning.py companies.jsonl companies_clean.jsonl
+# Expected output: Cleaned 477 records, removed 20 duplicates → 457 records saved
+```
+
+**Step 4 — Run a query interactively**
+```bash
+venv/bin/python main.py
+# Prompts: Search for companies: B2B SaaS HR companies in Europe
+```
+On first run, embeddings are computed and cached in `embeddings_cache/`. Subsequent runs load from cache and start in ~2 seconds.
+
+**Step 5 — Run the full evaluation**
+```bash
+venv/bin/python evaluate.py
+# Runs all 12 queries, scores with gpt-4o judge, prints aggregate metrics table
+# Expected: LLM NDCG@10 ~0.77, ROC-AUC ~0.84
+```
+
+**Step 6 — Run the cross-validation audit (optional)**
+```bash
+venv/bin/python cross_validation.py
+# Runs hardcoded demo queries and prints consistency check results
+```
+
+**Step 7 — Inspect NAICS inference (optional, standalone tool)**
+```bash
+venv/bin/python naics_inference.py
+# Loads companies_clean.jsonl, shows which companies gain secondary NAICS labels from core_offerings
+# Does not modify any files
+```
+
+Each script is self-contained. The dataset (`companies_clean.jsonl`) is never modified after step 3.

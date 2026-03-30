@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from solution import RankingEngine, _fmt_result
 
 engine = RankingEngine()

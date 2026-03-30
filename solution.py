@@ -92,6 +92,70 @@ REGION_MAP: dict[str, set[str]] = {
     },
 }
 
+CITY_MAP: dict[str, str] = {
+    # UK
+    "london": "gb", "manchester": "gb", "birmingham": "gb", "edinburgh": "gb",
+    "glasgow": "gb", "bristol": "gb", "leeds": "gb", "liverpool": "gb",
+    # Germany
+    "berlin": "de", "munich": "de", "hamburg": "de", "frankfurt": "de",
+    "cologne": "de", "stuttgart": "de", "dusseldorf": "de", "dortmund": "de",
+    "munich": "de", "leipzig": "de", "nuremberg": "de",
+    # France
+    "paris": "fr", "lyon": "fr", "marseille": "fr", "toulouse": "fr",
+    "bordeaux": "fr", "lille": "fr", "nice": "fr",
+    # Netherlands
+    "amsterdam": "nl", "rotterdam": "nl", "the hague": "nl", "utrecht": "nl",
+    "eindhoven": "nl",
+    # Switzerland
+    "zurich": "ch", "geneva": "ch", "basel": "ch", "bern": "ch",
+    # Austria
+    "vienna": "at", "graz": "at", "salzburg": "at",
+    # Nordics
+    "stockholm": "se", "gothenburg": "se", "malmo": "se",
+    "oslo": "no", "bergen": "no",
+    "copenhagen": "dk", "aarhus": "dk",
+    "helsinki": "fi", "espoo": "fi",
+    # Benelux
+    "brussels": "be", "antwerp": "be", "ghent": "be",
+    "luxembourg": "lu",
+    # Southern Europe
+    "madrid": "es", "barcelona": "es", "valencia": "es", "seville": "es",
+    "rome": "it", "milan": "it", "naples": "it", "turin": "it",
+    "lisbon": "pt", "porto": "pt",
+    "athens": "gr",
+    # CEE
+    "warsaw": "pl", "krakow": "pl", "wroclaw": "pl",
+    "prague": "cz", "brno": "cz",
+    "budapest": "hu",
+    "bucharest": "ro", "cluj": "ro",
+    "zagreb": "hr",
+    # North America
+    "new york": "us", "san francisco": "us", "los angeles": "us",
+    "chicago": "us", "boston": "us", "seattle": "us", "austin": "us",
+    "miami": "us", "denver": "us", "atlanta": "us", "dallas": "us",
+    "toronto": "ca", "vancouver": "ca", "montreal": "ca",
+    "mexico city": "mx",
+    # APAC
+    "sydney": "au", "melbourne": "au", "brisbane": "au",
+    "singapore": "sg",
+    "tokyo": "jp", "osaka": "jp",
+    "beijing": "cn", "shanghai": "cn", "shenzhen": "cn",
+    "seoul": "kr", "busan": "kr",
+    "mumbai": "in", "delhi": "in", "bangalore": "in", "hyderabad": "in",
+    "hong kong": "hk",
+    "taipei": "tw",
+    # Middle East / Africa
+    "dubai": "ae", "abu dhabi": "ae",
+    "tel aviv": "il", "jerusalem": "il",
+    "cape town": "za", "johannesburg": "za", "nairobi": "ke",
+    "cairo": "eg",
+    # Latin America
+    "sao paulo": "br", "rio de janeiro": "br",
+    "buenos aires": "ar",
+    "bogota": "co",
+    "santiago": "cl",
+}
+
 # ── Industry / NAICS ───────────────────────────────────────────────────────────
 
 # keyword → list of NAICS prefixes (2 or more digits)
@@ -103,11 +167,11 @@ NAICS_MAP: dict[str, list[str]] = {
     "transportation":   ["484","485","487"],
     "warehousing":      ["493"],
     "supply chain":     ["484","493"],
-    "software":         ["5112","511210"],
-    "saas":             ["5112","511210"],
-    "tech":             ["51","5112","518"],
-    "technology":       ["51","5112"],
-    "fintech":          ["522","5221","5222","5223"],
+    "software":         ["5112","511210","5132","513210"],
+    "saas":             ["5112","511210","5132","513210"],
+    "tech":             ["51","5112","518","513"],
+    "technology":       ["51","5112","513"],
+    "fintech":          ["522","5221","5222","5223","5112","5132","5415","518"],
     "finance":          ["52"],
     "banking":          ["5221","52211"],
     "financial":        ["52"],
@@ -139,12 +203,12 @@ NAICS_MAP: dict[str, list[str]] = {
     "aerospace":        ["3364"],
     "automotive":       ["3361","3362","3363"],
     "food":             ["311","722"],
-    "cybersecurity":    ["5112","5415"],
-    "cloud":            ["518","5112"],
+    "cybersecurity":    ["5112","5132","5415"],
+    "cloud":            ["518","5112","5132"],
     "data":             ["518","519"],
-    "ai":               ["5112","5415"],
+    "ai":               ["5112","5132","5415"],
     "education":        ["61"],
-    "edtech":           ["61","5112"],
+    "edtech":           ["61","5112","5132"],
     "hr":               ["5613"],
     "recruiting":       ["5613"],
     "legal":            ["5411"],
@@ -198,6 +262,7 @@ class Query:
     naics_prefixes:   list[str]       = field(default_factory=list)
     year_founded_min: int   | None    = None
     year_founded_max: int   | None    = None
+    city_names:        set[str]        = field(default_factory=set)   # lowercased city names
     industry_keywords: list[str]      = field(default_factory=list)  # for soft scoring
     expanded:         str   | None    = None                         # LLM-rewritten query for FAISS
 
@@ -278,6 +343,13 @@ def parse_intent(query: str) -> Query:
         if re.search(rf"\b{re.escape(region)}\b", ql):
             q.country_codes.update(codes)
             q.region_countries.update(codes)
+
+    # ── City (soft scoring; also pins the country via hard filter) ──
+    # Multi-word cities checked before single-word to avoid partial matches
+    for city, code in sorted(CITY_MAP.items(), key=lambda x: -len(x[0])):
+        if re.search(rf"\b{re.escape(city)}\b", ql):
+            q.city_names.add(city)
+            q.country_codes.add(code)   # country hard filter still applies
 
     # ── Employee count ──
     m = re.search(r"(\d[\d,]*)\s*\+\s*(?:employees|people|staff)", ql)
@@ -466,7 +538,16 @@ def _score_location(r: dict, q: Query) -> float:
         return 0.5   # no data → neutral
 
     if cc in q.country_codes:
-        # Exact country match
+        if q.city_names:
+            # Query specified a city — check the town field for a match
+            town = (addr.get("town") or "").lower()
+            if town and any(city in town or town in city for city in q.city_names):
+                return 1.0   # city match
+            elif cc not in q.region_countries:
+                return 0.7   # right country (explicitly named), wrong city
+            else:
+                return 0.5   # right region, wrong city → neutral
+        # No city specified
         if cc not in q.region_countries:
             return 1.0   # explicitly named country
         else:
@@ -494,11 +575,34 @@ def _score_size(r: dict, q: Query) -> float:
     return math.exp(-dist / scale)
 
 
-def _score_recency(r: dict) -> float:
+def _score_recency(r: dict, q: Query) -> float:
     yr = r.get("year_founded")
     if yr is None:
         return 0.5
-    return max(0.0, min(1.0, (float(yr) - YEAR_MIN) / (YEAR_MAX - YEAR_MIN)))
+
+    has_min = q.year_founded_min is not None
+    has_max = q.year_founded_max is not None
+
+    # No year signal in query → neutral; don't bias toward newer or older
+    if not has_min and not has_max:
+        return 0.5
+
+    normalized = max(0.0, min(1.0, (float(yr) - YEAR_MIN) / (YEAR_MAX - YEAR_MIN)))
+
+    # Query wants newer companies (startup, founded after X) → reward newer
+    if has_min and not has_max:
+        return normalized
+    # Query wants older companies (established, founded before X) → reward older
+    if has_max and not has_min:
+        return 1.0 - normalized
+    # Both bounds set (founded between X and Y) → reward being inside the window
+    lo = float(q.year_founded_min)
+    hi = float(q.year_founded_max)
+    if lo <= float(yr) <= hi:
+        return 1.0
+    dist = min(abs(float(yr) - lo), abs(float(yr) - hi))
+    span = max(hi - lo, 1.0)
+    return max(0.0, 1.0 - dist / span)
 
 
 def _compute_structured_score(
@@ -514,7 +618,7 @@ def _compute_structured_score(
       + W_INDUSTRY * _score_industry(r, q)
       + W_LOCATION * _score_location(r, q)
       + W_SIZE     * _score_size(r, q)
-      + W_RECENCY  * _score_recency(r)
+      + W_RECENCY  * _score_recency(r, q)
     )
 
 # ── Ranking Engine ─────────────────────────────────────────────────────────────
@@ -928,6 +1032,19 @@ class RankingEngine:
 
         top_stage3 = self._structured_score(q, candidates)
         results    = self._rerank_llm(q, top_stage3)
+
+        # Cross-attribute validation: demote implausible results
+        from cross_validation import validate
+        validated = []
+        demoted   = []
+        for r in results:
+            vr = validate(query, r)
+            if vr.is_plausible:
+                validated.append(r)
+            else:
+                print(f"  [CV] demoted: {r.get('name')} (conf={vr.confidence:.2f}) {vr.flags}", flush=True)
+                demoted.append(r)
+        results = validated + demoted   # keep demoted at bottom rather than dropping
 
         # Deduplicate by operational_name (same company can appear with multiple records)
         seen: set[str] = set()

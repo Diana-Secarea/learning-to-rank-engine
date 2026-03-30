@@ -44,10 +44,14 @@ from dataclasses import dataclass, field
 # in the incompatible set it's flagged as suspicious.
 
 NAICS_EXPECTED_BM: dict[str, set[str]] = {
-    # Software / SaaS
+    # Software / SaaS (511x = 2017 NAICS, 513x = 2022 NAICS renamed from 511210→513210)
     "511":  {"Software-as-a-Service", "Business-to-Business", "Subscription-Based",
               "Enterprise", "Business-to-Consumer"},
     "5112": {"Software-as-a-Service", "Business-to-Business", "Subscription-Based",
+              "Enterprise", "Business-to-Consumer"},
+    "513":  {"Software-as-a-Service", "Business-to-Business", "Subscription-Based",
+              "Enterprise", "Business-to-Consumer"},
+    "5132": {"Software-as-a-Service", "Business-to-Business", "Subscription-Based",
               "Enterprise", "Business-to-Consumer"},
     "518":  {"Software-as-a-Service", "Business-to-Business", "Enterprise"},
     # Manufacturing (broad)
@@ -146,6 +150,9 @@ QUERY_INTENT_RULES: list[dict] = [
             "Expected finance (52x) or software (511x) sector."
         ),
         "exceptions": [],
+        # Finance-sector companies also need tech signals — a currency exchange or
+        # traditional bank is NOT fintech just because it's in NAICS 52x.
+        "tech_signal_required_for_finance_naics": True,
     },
 ]
 
@@ -287,6 +294,23 @@ def _check_query_plausibility(query: str, company: dict) -> list[str]:
         if code and not _naics_prefix_match(code, rule["required_naics_prefixes"]):
             msg = rule["exclusion_message"].format(code=code, label=label)
             flags.append(msg)
+        elif code and rule.get("tech_signal_required_for_finance_naics"):
+            # NAICS matched, but if it's finance-only (not software) we also need
+            # tech signals in the company's text — e.g. "City Exchange" (522x) should
+            # not rank for a "fintech" query if it has no tech terms at all.
+            is_finance_only = (
+                _naics_prefix_match(code, FINANCE_NAICS)
+                and not _naics_prefix_match(code, SOFTWARE_NAICS)
+            )
+            if is_finance_only:
+                tech_signals = ["software", "saas", "platform", "app", "application",
+                                "cloud", "api", "digital", "technology", "tech", "data",
+                                "fintech", "payments", "blockchain", "ai", "machine learning"]
+                if not any(sig in full_text for sig in tech_signals):
+                    flags.append(
+                        f"Query asks for fintech but NAICS {code} ({label}) is traditional "
+                        f"finance with no technology signals in company profile."
+                    )
 
     return flags
 
